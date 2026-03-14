@@ -7,9 +7,9 @@ const _geist = Geist({ subsets: ["latin"] });
 const _geistMono = Geist_Mono({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: 'WhipsrDoc Pro',
-  description: 'Professional document viewer with AI assistant',
-  generator: 'v0.app',
+  title: 'WhisprDoc Pro',
+  description: 'Speech-to-Autofill PDF editor',
+  generator: 'WhisprDoc Pro',
   icons: {
     icon: [
       {

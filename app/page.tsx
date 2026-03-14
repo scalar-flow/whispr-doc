@@ -16,7 +16,8 @@ export default function WhisprDocPro() {
 
   const hasPdf = pdfFile !== null
 
-  const handleFileSelect = useCallback((file: File) => {
+  const handleFileSelect = useCallback((file: File | null) => {
+    if (!file) return
     setPdfFile(file)
     setCurrentPage(1)
     setTotalPages(0)
@@ -45,6 +46,7 @@ export default function WhisprDocPro() {
           onToggleAssistant={() => setIsAssistantOpen(!isAssistantOpen)}
           pdfFile={pdfFile}
           onFileSelect={handleFileSelect}
+          onReset={() => setPdfFile(null)}
         />
         {isAssistantOpen && (
           <DocumentAssistant onClose={() => setIsAssistantOpen(false)} hasPdf={hasPdf} />
