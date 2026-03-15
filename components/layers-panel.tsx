@@ -1,27 +1,114 @@
 "use client"
 
-import { ChevronDown, ChevronRight, FileText, Type, Image, AlignLeft, Square, Filter, Layers } from "lucide-react"
+import { useState, useRef, useEffect } from "react"
+import {
+  ChevronDown,
+  ChevronRight,
+  FileText,
+  Type,
+  Filter,
+  Layers,
+  CheckSquare,
+  CircleDot,
+  CalendarFold,
+  AlignJustify,
+  PenTool
+} from "lucide-react"
+import type { DetectedField } from "@/lib/pdf-utils"
 
 interface LayersPanelProps {
   currentPage: number
   onPageChange: (page: number) => void
   totalPages: number
   hasPdf: boolean
+  fields?: DetectedField[]
+  focusedFieldName: string | null
+  onFieldClick: (fieldName: string, pageNumber: number) => void
+  onFieldRename: (oldName: string, newName: string) => void
 }
 
-const pageElements: Record<number, { icon: React.ElementType; name: string }[]> = {
-  1: [
-    { icon: Type, name: "Header_Title" },
-    { icon: Image, name: "Company_Logo" },
-    { icon: AlignLeft, name: "Intro_Paragraph" },
-    { icon: Square, name: "Chart_Container" },
-  ],
-  2: [],
-  3: [],
-}
+export function LayersPanel({
+  currentPage,
+  onPageChange,
+  totalPages,
+  hasPdf,
+  fields = [],
+  focusedFieldName,
+  onFieldClick,
+  onFieldRename
+}: LayersPanelProps) {
+  const [editingField, setEditingField] = useState<string | null>(null)
+  const [editValue, setEditValue] = useState("")
+  const inputRef = useRef<HTMLInputElement>(null)
 
-export function LayersPanel({ currentPage, onPageChange, totalPages, hasPdf }: LayersPanelProps) {
-  const pages = Array.from({ length: Math.min(totalPages, 10) }, (_, i) => i + 1)
+  // Track expanded/collapsed state for pages
+  const [expandedPages, setExpandedPages] = useState<Record<number, boolean>>({})
+
+  // Keep track of the previous current page to collapse it when moving away
+  const prevPageRef = useRef(currentPage)
+
+  // Automatically expand the current page and collapse the previous page 
+  // when navigating via other means (e.g., scrolling the PDF)
+  useEffect(() => {
+    setExpandedPages((prev) => {
+      const newState = { ...prev }
+
+      // Collapse the previously active page if it's different from the new one
+      if (prevPageRef.current && prevPageRef.current !== currentPage) {
+        newState[prevPageRef.current] = false
+      }
+
+      // Expand the newly active page
+      newState[currentPage] = true
+      return newState
+    })
+
+    // Update the ref to the new current page
+    prevPageRef.current = currentPage
+  }, [currentPage])
+
+  // Group fields by page (pageIndex + 1)
+  const fieldsByPage = fields.reduce((acc, field) => {
+    const pageIndex = Number(field.rect?.pageIndex) || 0
+    const pageNumber = pageIndex + 1
+    if (!acc[pageNumber]) acc[pageNumber] = []
+    acc[pageNumber].push(field)
+    return acc
+  }, {} as Record<number, DetectedField[]>)
+
+  // Only get the page numbers that actually have fields, sorted incrementally
+  const pagesWithFields = Object.keys(fieldsByPage).map(Number).sort((a, b) => a - b)
+
+  const getFieldIcon = (type: string, isSelected: boolean) => {
+    switch (type) {
+      case "checkbox": return <CheckSquare className={`h-4 w-4 ${isSelected ? "text-blue-500" : "text-muted-foreground"}`} />
+      case "radio": return <CircleDot className={`h-4 w-4 ${isSelected ? "text-blue-500" : "text-muted-foreground"}`} />
+      case "date": return <CalendarFold className={`h-4 w-4 ${isSelected ? "text-blue-500" : "text-muted-foreground"}`} />
+      case "multiline": return <AlignJustify className={`h-4 w-4 ${isSelected ? "text-blue-500" : "text-muted-foreground"}`} />
+      case "signature": return <PenTool className={`h-4 w-4 ${isSelected ? "text-blue-500" : "text-muted-foreground"}`} />
+      default: return <Type className={`h-4 w-4 ${isSelected ? "text-blue-500" : "text-muted-foreground"}`} />
+    }
+  }
+
+  const allPages = Array.from({ length: totalPages }, (_, i) => i + 1)
+  const pagesToRender = allPages.length > 0 ? allPages : pagesWithFields
+
+  const handlePageClick = (page: number) => {
+    if (page === currentPage) {
+      // Toggle collapse/expand if clicking the currently active page
+      setExpandedPages((prev) => ({ ...prev, [page]: !prev[page] }))
+    } else {
+      // Immediately update state for snappier UI when clicking 
+      // (the useEffect will run as well when the prop updates to catch any desyncs)
+      setExpandedPages((prev) => {
+        const newState = { ...prev }
+        newState[currentPage] = false // Collapse the old page immediately
+        newState[page] = true         // Expand the new page immediately
+        return newState
+      })
+      onPageChange(page)
+    }
+  }
 
   return (
     <aside className="flex w-60 flex-col border-r border-border bg-background">
@@ -44,42 +131,83 @@ export function LayersPanel({ currentPage, onPageChange, totalPages, hasPdf }: L
               Upload a PDF to view its layers and fields
             </p>
           </div>
+        ) : fields.length === 0 ? (
+          <div className="p-4 text-center text-sm text-muted-foreground">
+            No fields detected
+          </div>
         ) : (
-          pages.map((page) => {
+          pagesToRender.map((page) => {
             const isSelected = page === currentPage
-            const elements = pageElements[page] || []
+            const elements = fieldsByPage[page] || []
+            // Default to selected if not explicitly set in state
+            const isExpanded = expandedPages[page] ?? isSelected
 
             return (
               <div key={page}>
                 <button
-                  onClick={() => onPageChange(page)}
-                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors ${
-                    isSelected
-                      ? "bg-sidebar-accent text-primary"
-                      : "text-foreground hover:bg-muted"
-                  }`}
+                  onClick={() => handlePageClick(page)}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm transition-colors ${isSelected
+                    ? "bg-sidebar-accent text-primary"
+                    : "text-foreground hover:bg-muted"
+                    }`}
                 >
-                  {isSelected ? (
-                    <ChevronDown className="h-4 w-4 text-primary" />
+                  {isExpanded ? (
+                    <ChevronDown className={`h-4 w-4 ${isSelected ? "text-primary" : "text-muted-foreground"}`} />
                   ) : (
-                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                    <ChevronRight className={`h-4 w-4 ${isSelected ? "text-primary" : "text-muted-foreground"}`} />
                   )}
                   <FileText className={`h-4 w-4 ${isSelected ? "text-primary" : "text-muted-foreground"}`} />
                   <span className={isSelected ? "font-medium" : ""}>
                     Page {page}
                   </span>
                 </button>
-                {isSelected && elements.length > 0 && (
+                {/* Now respects the isExpanded state to actually collapse the area */}
+                {isExpanded && elements.length > 0 && (
                   <div className="ml-6">
-                    {elements.map((element, index) => (
-                      <div
-                        key={index}
-                        className="flex items-center gap-2 py-1.5 pl-4 pr-3 text-sm text-foreground hover:bg-muted"
-                      >
-                        <element.icon className="h-4 w-4 text-muted-foreground" />
-                        <span>{element.name}</span>
-                      </div>
-                    ))}
+                    {elements.map((element, index) => {
+                      const isFieldFocused = focusedFieldName === element.name
+                      const isEditing = editingField === element.name
+
+                      return (
+                        <div
+                          key={index}
+                          onClick={() => onFieldClick(element.name, page)}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation()
+                            setEditingField(element.name)
+                            setEditValue(element.name)
+                          }}
+                          className={`flex items-center gap-2 py-1.5 pl-4 pr-3 text-sm transition-colors cursor-pointer overflow-hidden ${isFieldFocused ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted"
+                            }`}
+                        >
+                          <span className="shrink-0">{getFieldIcon(element.type || "text", isEditing)}</span>
+                          {isEditing ? (
+                            <input
+                              ref={inputRef}
+                              autoFocus
+                              className="h-5 w-full bg-transparent border-none outline-none focus:ring-0 p-0 text-sm font-medium"
+                              value={editValue}
+                              onChange={(e) => setEditValue(e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  onFieldRename(element.name, editValue)
+                                  setEditingField(null)
+                                } else if (e.key === "Escape") {
+                                  setEditingField(null)
+                                }
+                              }}
+                              onBlur={() => {
+                                onFieldRename(element.name, editValue)
+                                setEditingField(null)
+                              }}
+                            />
+                          ) : (
+                            <span className="truncate" title={element.name}>{element.name}</span>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>

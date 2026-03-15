@@ -2,7 +2,8 @@
 
 import "@/lib/polyfill"
 import { useCallback, useState, useRef, useEffect } from "react"
-import { Document, Page, pdfjs } from "react-pdf"
+import { useForm, FormProvider } from "react-hook-form"
+import { pdfjs } from "react-pdf"
 import "react-pdf/dist/esm/Page/AnnotationLayer.css"
 import "react-pdf/dist/esm/Page/TextLayer.css"
 import {
@@ -10,7 +11,6 @@ import {
   MousePointer2,
   Hand,
   Wand,
-  Mic,
   ChevronLeft,
   ChevronRight,
   Minus,
@@ -18,12 +18,18 @@ import {
   Search,
   MessageSquare,
   ChevronDown,
-  Upload,
   RefreshCw,
   LocateFixed,
   FileText,
   FileSpreadsheet,
   FileType,
+  CheckSquare,
+  CircleDot,
+  CalendarFold,
+  AlignJustify,
+  PenTool,
+  Type,
+  Play
 } from "lucide-react"
 import {
   Popover,
@@ -43,10 +49,17 @@ import GoogleDrive from "@uppy/google-drive"
 import Dropbox from "@uppy/dropbox"
 import OneDrive from "@uppy/onedrive"
 import Box from "@uppy/box"
+import FileTypes from "./icons/file-types"
 
 // Updated Uppy v4 CSS paths
 import "@uppy/core/css/style.css"
 import "@uppy/dashboard/css/style.css"
+
+import type { DetectedField, AutofilledFieldState, DetectionMode } from "@/lib/pdf-utils"
+import { detectFormFields, fillPdfFields, generateEmptyAcroForm } from "@/lib/pdf-utils"
+import { detectVisualFieldsAction, detectFieldAtPositionAction } from "@/app/actions"
+import { PdfViewer } from "./pdf-viewer"
+import { AudioRecorder } from "./audio-recorder-popover"
 
 pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`
 
@@ -64,7 +77,22 @@ interface DocumentViewerProps {
   pdfFile: File | null
   onReset: () => void
   onFileSelect: (file: File | null) => void
+  onFieldsChange?: (fields: DetectedField[]) => void
+  focusedFieldName: string | null
+  onFocusedFieldChange: (fieldName: string | null) => void
+  onFieldRename: (oldName: string, newName: string) => void
+  lastRename?: { oldName: string, newName: string } | null
 }
+
+const MODES: { id: DetectionMode; label: string; icon: any }[] = [
+  { id: "auto", label: "Auto", icon: Play },
+  { id: "text", label: "Text", icon: Type },
+  { id: "date", label: "Date", icon: CalendarFold },
+  { id: "multiline", label: "Multiline", icon: AlignJustify },
+  { id: "checkbox", label: "Checkbox", icon: CheckSquare },
+  { id: "radio", label: "Radio", icon: CircleDot },
+  { id: "signature", label: "Signature", icon: PenTool },
+]
 
 export function DocumentViewer({
   currentPage,
@@ -80,19 +108,40 @@ export function DocumentViewer({
   pdfFile,
   onReset,
   onFileSelect,
+  onFieldsChange,
+  focusedFieldName,
+  onFocusedFieldChange,
+  onFieldRename,
+  lastRename,
 }: DocumentViewerProps) {
   const [isLocalDragging, setIsLocalDragging] = useState(false)
   const [isGlobalDragging, setIsGlobalDragging] = useState(false)
   const [pdfUrl, setPdfUrl] = useState<string | null>(null)
   const [isWandActive, setIsWandActive] = useState(false)
+  const [isDetectionPopoverOpen, setIsDetectionPopoverOpen] = useState(false)
+  const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [uppy, setUppy] = useState<Uppy | null>(null)
+
+  // PDF Form Filler State
+  const [pdfBytes, setPdfBytes] = useState<ArrayBuffer | null>(null)
+  const [fields, setFields] = useState<DetectedField[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+  const [fileName, setFileName] = useState<string>("")
+  const [autofilledFields, setAutofilledFields] = useState<AutofilledFieldState[]>([])
+  const [detectionMode, setDetectionMode] = useState<DetectionMode | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const dragCounter = useRef(0)
+  const detectionLockRef = useRef(false)
+  const clickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const hasPdf = pdfFile !== null
+  const methods = useForm<Record<string, string | boolean>>({
+    defaultValues: {},
+  })
 
-  // 1. Initialize Uppy strictly on the client (fixes SSR document is not defined error)
+  const hasPdf = pdfFile !== null || pdfBytes !== null
+
+  // Init Uppy
   useEffect(() => {
     const u = new Uppy({
       restrictions: {
@@ -102,7 +151,6 @@ export function DocumentViewer({
       autoProceed: false,
     })
 
-    // Natively handles the modal popup (inline: false)
     u.use(Dashboard, {
       id: "Dashboard",
       inline: false,
@@ -110,88 +158,149 @@ export function DocumentViewer({
       proudlyDisplayPoweredByUppy: false,
     })
 
-    // Attach external providers directly to the Vanilla Dashboard plugin with TS bypass
     u.use(GoogleDrive, { target: Dashboard as any, companionUrl: "https://companion.uppy.io" })
     u.use(Dropbox, { target: Dashboard as any, companionUrl: "https://companion.uppy.io" })
     u.use(OneDrive, { target: Dashboard as any, companionUrl: "https://companion.uppy.io" })
     u.use(Box, { target: Dashboard as any, companionUrl: "https://companion.uppy.io" })
 
     setUppy(u)
-
-    // Clean up Uppy native DOM nodes when unmounting
-    return () => {
-      u.destroy()
-    }
+    return () => u.destroy()
   }, [])
 
-  // Programmatically open the native Uppy Modal
+  const updateFields = useCallback(
+    (update: DetectedField[] | ((prev: DetectedField[]) => DetectedField[])) => {
+      setFields(update)
+    },
+    []
+  )
+
+  useEffect(() => {
+    onFieldsChange?.(fields)
+  }, [fields, onFieldsChange])
+
+  // Sync internal state when fields are renamed from outside (e.g. LayersPanel)
+  useEffect(() => {
+    if (lastRename) {
+      const { oldName, newName } = lastRename
+
+      // Update local fields state if it hasn't been updated yet
+      setFields(prev => prev.map(f => f.name === oldName ? { ...f, name: newName } : f))
+
+      // Update autofilledFields
+      setAutofilledFields(prev => prev.map(af =>
+        af.fieldName === oldName ? { ...af, fieldName: newName } : af
+      ))
+
+      // Update form values
+      const currentValue = methods.getValues(oldName)
+      methods.setValue(newName, currentValue)
+      methods.unregister(oldName)
+    }
+  }, [lastRename, methods])
+
   const openDashboard = useCallback(() => {
     if (!uppy) return
     const dashboard = uppy.getPlugin("Dashboard")
     if (dashboard) {
-      // @ts-ignore - Bypass Uppy typing strictness for openModal method
+      // @ts-ignore
       dashboard.openModal()
     }
   }, [uppy])
 
-  // Handle Uppy File Completions
-  useEffect(() => {
-    if (!uppy) return
+  const getCurrentDate = () => {
+    const today = new Date();
+    const mm = String(today.getMonth() + 1).padStart(2, '0');
+    const dd = String(today.getDate()).padStart(2, '0');
+    const yyyy = today.getFullYear();
+    return `${mm}/${dd}/${yyyy}`;
+  }
 
-    const handleComplete = (result: any) => {
-      // Safely verify result.successful exists to satisfy TypeScript
-      if (result.successful && result.successful.length > 0) {
-        const uppyFile = result.successful[0]
-        if (uppyFile.data instanceof Blob || uppyFile.data instanceof File) {
-          const file = new File([uppyFile.data], uppyFile.name, { type: uppyFile.type })
-          onFileSelect(file)
-          setPdfUrl(URL.createObjectURL(file))
+  const checkOverlap = (rect1: any, rect2: any) => {
+    return (
+      rect1.x < rect2.x + rect2.width &&
+      rect1.x + rect1.width > rect2.x &&
+      rect1.y < rect2.y + rect2.height &&
+      rect1.y + rect1.height > rect2.y
+    );
+  }
 
-          // Auto-close native modal on success
-          const dashboard = uppy.getPlugin("Dashboard")
-          if (dashboard) {
-            // @ts-ignore
-            dashboard.closeModal()
+  const handleFileProcess = useCallback(async (file: File) => {
+    onFileSelect(file)
+    setIsLoading(true)
+    try {
+      const arrayBuffer = await file.arrayBuffer()
+      setPdfBytes(arrayBuffer)
+      setFileName(file.name)
+
+      const [acroFields, visualFields] = await Promise.all([
+        detectFormFields(arrayBuffer),
+        (async () => {
+          const formData = new FormData()
+          formData.append("file", file)
+          try {
+            return await detectVisualFieldsAction(formData)
+          } catch (e) {
+            console.error("Visual detection failed:", e)
+            return []
           }
+        })(),
+      ])
+
+      const filteredVisualFields = visualFields.filter((vField) => {
+        if (!vField.rect) return true
+        const hasOverlap = acroFields.some((aField) => {
+          if (!aField.rect) return false
+          if (aField.rect.pageIndex !== vField.rect!.pageIndex) return false
+          return checkOverlap(vField.rect, aField.rect)
+        })
+        return !hasOverlap
+      })
+
+      const detectedFields = [...acroFields, ...filteredVisualFields]
+      updateFields(detectedFields)
+
+      const defaults: Record<string, string | boolean> = {}
+      detectedFields.forEach((field) => {
+        if (field.type === "checkbox" || field.type === "radio") {
+          defaults[field.name] = false
+        } else if (field.type === "date") {
+          defaults[field.name] = getCurrentDate();
+        } else {
+          defaults[field.name] = ""
         }
-      }
+      })
+      methods.reset(defaults)
+      setAutofilledFields([])
+
+      const blob = new Blob([arrayBuffer], { type: "application/pdf" })
+      const url = URL.createObjectURL(blob)
+      setPdfUrl(url)
+    } catch (error) {
+      console.error("Error processing PDF:", error)
+    } finally {
+      setIsLoading(false)
     }
+  }, [onFileSelect, methods])
 
-    uppy.on("complete", handleComplete)
-
-    return () => {
-      uppy.off("complete", handleComplete)
-    }
-  }, [uppy, onFileSelect])
-
-  // Global Drag & Drop functionality
   useEffect(() => {
     const handleDragEnter = (e: DragEvent) => {
       e.preventDefault()
       dragCounter.current += 1
-      if (e.dataTransfer?.types.includes("Files")) {
-        setIsGlobalDragging(true)
-      }
+      if (e.dataTransfer?.types.includes("Files")) setIsGlobalDragging(true)
     }
     const handleDragLeave = (e: DragEvent) => {
       e.preventDefault()
       dragCounter.current -= 1
-      if (dragCounter.current === 0) {
-        setIsGlobalDragging(false)
-      }
+      if (dragCounter.current === 0) setIsGlobalDragging(false)
     }
-    const handleDragOver = (e: DragEvent) => {
-      e.preventDefault()
-    }
+    const handleDragOver = (e: DragEvent) => e.preventDefault()
     const handleDrop = (e: DragEvent) => {
       e.preventDefault()
       dragCounter.current = 0
       setIsGlobalDragging(false)
       const files = e.dataTransfer?.files
       if (files && files.length > 0 && files[0].type === "application/pdf") {
-        const file = files[0]
-        onFileSelect(file)
-        setPdfUrl(URL.createObjectURL(file))
+        handleFileProcess(files[0])
       }
     }
 
@@ -206,22 +315,17 @@ export function DocumentViewer({
       window.removeEventListener("dragover", handleDragOver)
       window.removeEventListener("drop", handleDrop)
     }
-  }, [onFileSelect])
-
-  const onDocumentLoadSuccess = useCallback(
-    ({ numPages }: { numPages: number }) => {
-      onTotalPagesChange(numPages)
-    },
-    [onTotalPagesChange]
-  )
+  }, [handleFileProcess])
 
   const handleReset = useCallback(() => {
     setPdfUrl(null)
+    setPdfBytes(null)
+    updateFields([])
+    setAutofilledFields([])
+    setIsWandActive(false)
     onFileSelect(null)
     onReset()
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ""
-    }
+    if (fileInputRef.current) fileInputRef.current.value = ""
     uppy?.cancelAll()
   }, [onFileSelect, uppy, onReset])
 
@@ -229,321 +333,687 @@ export function DocumentViewer({
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const files = e.target.files
       if (files && files.length > 0 && files[0].type === "application/pdf") {
-        const file = files[0]
-        onFileSelect(file)
-        setPdfUrl(URL.createObjectURL(file))
+        handleFileProcess(files[0])
       }
-    }, [onFileSelect]
+    }, [handleFileProcess]
   )
 
-  const handleClick = useCallback(() => {
-    fileInputRef.current?.click()
+  const handleClick = useCallback(() => fileInputRef.current?.click(), [])
+
+  const generateSampleJson = () => {
+    const sample: Record<string, string | boolean> = {}
+    fields.forEach((field) => {
+      if (field.type === "checkbox" || field.type === "radio") {
+        sample[field.name] = true
+      } else if (field.type === "dropdown" && field.options?.length) {
+        sample[field.name] = field.options[0]
+      } else if (field.type === "signature") {
+        sample[field.name] = ""
+      } else if (field.type === "date") {
+        sample[field.name] = getCurrentDate()
+      } else {
+        sample[field.name] = String(field.name)
+      }
+    })
+    return JSON.stringify(sample, null, 2)
+  }
+
+  const handleAutoFill = useCallback((data: Record<string, string | boolean>) => {
+    const currentValues = methods.getValues()
+    const mergedValues = { ...currentValues, ...data }
+    methods.reset(mergedValues)
+    setAutofilledFields((prev) => {
+      const newFields = [...prev]
+      Object.entries(data).forEach(([fieldName, value]) => {
+        const index = newFields.findIndex((af) => af.fieldName === fieldName)
+        if (index >= 0) {
+          newFields[index] = { ...newFields[index], value, accepted: false }
+        } else {
+          const fieldDef = fields.find((f) => f.name === fieldName)
+          if (fieldDef) {
+            newFields.push({
+              fieldName,
+              type: fieldDef.type || "text",
+              value,
+              accepted: false,
+            })
+          }
+        }
+      })
+      return newFields
+    })
+  }, [methods, fields])
+
+  const handleWandToggle = (checked: boolean) => {
+    setIsWandActive(checked)
+    if (checked) {
+      const sampleStr = generateSampleJson()
+      const sampleData = JSON.parse(sampleStr)
+      handleAutoFill(sampleData)
+    } else {
+      setAutofilledFields([])
+    }
+  }
+
+  const handlePointDetection = useCallback(
+    async (pageIndex: number, x: number, y: number, mode: DetectionMode) => {
+      if (!pdfBytes || detectionLockRef.current) return;
+      if (clickTimeoutRef.current) {
+        clearTimeout(clickTimeoutRef.current);
+        clickTimeoutRef.current = null;
+        setDetectionMode(null);
+        return;
+      }
+
+      clickTimeoutRef.current = setTimeout(async () => {
+        clickTimeoutRef.current = null;
+        detectionLockRef.current = true;
+        try {
+          const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+          const formData = new FormData();
+          formData.append("file", blob, fileName || "document.pdf");
+
+          const newField = await detectFieldAtPositionAction(formData, pageIndex, x, y, mode);
+
+          if (newField && newField.rect) {
+            if (newField.type === "multiline" && newField.rect.height < 20) return;
+
+            const hasInvalidOverlap = fields.some(existingField => {
+              if (!existingField.rect || !newField.rect) return false;
+              if (existingField.rect.pageIndex !== newField.rect.pageIndex) return false;
+
+              if (newField.type === 'text' || newField.type === 'multiline') {
+                const isExactDuplicate =
+                  Math.abs(existingField.rect.x - newField.rect.x) < 1 &&
+                  Math.abs(existingField.rect.y - newField.rect.y) < 1 &&
+                  Math.abs(existingField.rect.width - newField.rect.width) < 1 &&
+                  Math.abs(existingField.rect.height - newField.rect.height) < 1;
+                if (isExactDuplicate) return true;
+
+                if (existingField.type === 'signature') {
+                  const r1 = existingField.rect;
+                  const r2 = newField.rect;
+                  const intersectLeft = Math.max(r1.x, r2.x);
+                  const intersectTop = Math.max(r1.y, r2.y);
+                  const intersectRight = Math.min(r1.x + r1.width, r2.x + r2.width);
+                  const intersectBottom = Math.min(r1.y + r1.height, r2.y + r2.height);
+                  const intersectWidth = Math.max(0, intersectRight - intersectLeft);
+                  const intersectHeight = Math.max(0, intersectBottom - intersectTop);
+                  const intersectionArea = intersectWidth * intersectHeight;
+                  const newFieldArea = r2.width * r2.height;
+
+                  if (newFieldArea > 0 && (intersectionArea / newFieldArea) >= 0.40) return true;
+                }
+                return false;
+              }
+
+              const intersects = checkOverlap(existingField.rect, newField.rect);
+              if (!intersects) return false;
+              if (newField.type !== "signature") return true;
+
+              const r1 = existingField.rect;
+              const r2 = newField.rect;
+              const intersectLeft = Math.max(r1.x, r2.x);
+              const intersectTop = Math.max(r1.y, r2.y);
+              const intersectRight = Math.min(r1.x + r1.width, r2.x + r2.width);
+              const intersectBottom = Math.min(r1.y + r1.height, r2.y + r2.height);
+              const intersectWidth = Math.max(0, intersectRight - intersectLeft);
+              const intersectHeight = Math.max(0, intersectBottom - intersectTop);
+              const intersectionArea = intersectWidth * intersectHeight;
+              const newFieldArea = r2.width * r2.height;
+
+              return newFieldArea > 0 && (intersectionArea / newFieldArea) > 0.40;
+            });
+
+            if (hasInvalidOverlap) return;
+
+            const baseName = newField.name;
+            let uniqueName = baseName;
+            let counter = 2;
+            while (fields.some((f) => f.name === uniqueName)) {
+              uniqueName = `${baseName}_${counter}`;
+              counter++;
+            }
+            newField.name = uniqueName;
+
+            updateFields(prev => [...prev, newField]);
+
+            let defaultValue: string | boolean = "";
+            if (newField.type === "checkbox" || newField.type === "radio") defaultValue = false;
+            else if (newField.type === "signature") defaultValue = "";
+            else if (newField.type === "date") defaultValue = getCurrentDate();
+            else defaultValue = newField.name;
+
+            methods.setValue(newField.name, defaultValue);
+            setAutofilledFields(prev => [...prev, {
+              fieldName: newField.name,
+              type: newField.type,
+              value: defaultValue,
+              accepted: false
+            }])
+          }
+        } catch (e) {
+          console.error("Point detection failed:", e);
+        } finally {
+          setTimeout(() => { detectionLockRef.current = false; }, 500);
+        }
+      }, 250);
+    }, [pdfBytes, fileName, methods, fields]
+  );
+
+  const handleFieldResize = useCallback((fieldName: string, width: number, height: number, fontSize?: number) => {
+    updateFields((prev) =>
+      prev.map((f) => {
+        if (f.name === fieldName && f.rect) {
+          return { ...f, rect: { ...f.rect, width, height }, ...(fontSize ? { fontSize } : {}) }
+        }
+        return f
+      })
+    )
   }, [])
 
+  const handleFieldRelocate = useCallback(async (fieldName: string, pageIndex: number, x: number, y: number) => {
+    if (!pdfBytes) return;
+    const currentField = fields.find(f => f.name === fieldName);
+    if (!currentField || !currentField.rect) return;
+
+    updateFields(prev => prev.map(f => f.name === fieldName ? { ...f, rect: { ...f.rect!, x, y }, paddingTop: 0 } : f));
+
+    try {
+      const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+      const formData = new FormData();
+      formData.append("file", blob, fileName || "document.pdf");
+
+      let detectX = x;
+      let detectY = y;
+      if (currentField.type === 'signature' || currentField.type === 'multiline') {
+        detectX = x + (currentField.rect.width / 2);
+        detectY = y + (currentField.rect.height / 2);
+      }
+
+      const snappedField = await detectFieldAtPositionAction(
+        formData, pageIndex, x, y, currentField.type as DetectionMode, true, currentField.rect.width, currentField.rect.height
+      );
+
+      if (snappedField && snappedField.rect) {
+        if (currentField.type === 'multiline' && snappedField.rect.height < 30) return;
+        if (['text', 'multiline', 'signature'].includes(currentField.type)) {
+          const w = snappedField.rect.width;
+          const h = snappedField.rect.height;
+          const isSmallSquare = (w < 40 && h < 40 && Math.abs(w - h) < 5);
+          if (snappedField.type === 'checkbox' || snappedField.type === 'radio' || isSmallSquare) {
+            if (currentField.type !== 'signature' || snappedField.type !== 'signature') return;
+          }
+        }
+        if (currentField.type === 'text') {
+          if (currentField.rect.width > (snappedField.rect.width + 2) || currentField.rect.height > (snappedField.rect.height + 2)) return;
+        }
+
+        const isOccupied = fields.some(other => {
+          if (other.name === fieldName) return false;
+          if (!other.rect || other.rect.pageIndex !== pageIndex) return false;
+          const intersects = checkOverlap(snappedField.rect, other.rect);
+          if (!intersects) return false;
+
+          if (currentField.type === 'signature') {
+            const r1 = snappedField.rect;
+            const r2 = other.rect;
+            if (!r1 || !r2) return false;
+            const intersectLeft = Math.max(r1.x, r2.x);
+            const intersectTop = Math.max(r1.y, r2.y);
+            const intersectRight = Math.min(r1.x + r1.width, r2.x + r2.width);
+            const intersectBottom = Math.min(r1.y + r1.height, r2.y + r2.height);
+            const intersectionArea = Math.max(0, intersectRight - intersectLeft) * Math.max(0, intersectBottom - intersectTop);
+            const snappedArea = r1.width * r1.height;
+            return snappedArea > 0 && (intersectionArea / snappedArea) > 0.50;
+          }
+          return true;
+        });
+
+        if (!isOccupied) {
+          updateFields(prev => prev.map(f => f.name === fieldName ? { ...f, rect: snappedField.rect, paddingTop: snappedField.paddingTop } : f));
+        }
+      }
+    } catch (e) {
+      console.error("Relocation failed:", e);
+    }
+  }, [pdfBytes, fileName, fields])
+
+  const handleBatchFieldChange = useCallback((updates: Record<string, string | boolean>) => {
+    Object.entries(updates).forEach(([fieldName, value]) => methods.setValue(fieldName, value))
+    setAutofilledFields((prev) => {
+      let newFields = [...prev]
+      Object.entries(updates).forEach(([fieldName, value]) => {
+        const index = newFields.findIndex(af => af.fieldName === fieldName)
+        if (index >= 0) {
+          newFields[index] = { ...newFields[index], value }
+        } else {
+          const fieldDef = fields.find(f => f.name === fieldName)
+          newFields.push({ fieldName, type: fieldDef?.type || "text", value, accepted: false })
+        }
+      })
+      return newFields
+    })
+  }, [methods, fields])
+
+  const handleFieldChange = useCallback((fieldName: string, value: string | boolean) => {
+    methods.setValue(fieldName, value)
+    setAutofilledFields((prev) => prev.map((af) => (af.fieldName === fieldName ? { ...af, value } : af)))
+  }, [methods])
+
+  const handleAcceptField = useCallback((fieldName: string) => {
+    setAutofilledFields((prev) => prev.map((af) => (af.fieldName === fieldName ? { ...af, accepted: true } : af)))
+  }, [])
+
+  const handleAcceptAll = useCallback(() => {
+    setAutofilledFields((prev) => prev.map((af) => af.type === "signature" ? af : { ...af, accepted: true }))
+  }, [])
+
+  const handleFieldEdit = useCallback((fieldName: string) => {
+    setAutofilledFields((prev) => prev.map((af) => (af.fieldName === fieldName ? { ...af, accepted: false } : af)))
+  }, [])
+
+  const handleDeleteField = useCallback((fieldName: string) => {
+    setAutofilledFields((prev) => prev.filter((af) => af.fieldName !== fieldName))
+    updateFields((prev) => prev.filter((f) => f.name !== fieldName))
+  }, [])
+
+  const handleRenameFieldInternal = useCallback((oldName: string, newName: string) => {
+    if (!newName || oldName === newName) return
+
+    // Update autofilledFields
+    setAutofilledFields(prev => prev.map(af =>
+      af.fieldName === oldName ? { ...af, fieldName: newName } : af
+    ))
+
+    // Update form values
+    const currentValue = methods.getValues(oldName)
+    methods.setValue(newName, currentValue)
+    methods.unregister(oldName)
+
+    // Notify parent
+    onFieldRename(oldName, newName)
+  }, [methods, onFieldRename])
+
+  const exportPdf = useCallback(async (openInNewTab: boolean) => {
+    if (!pdfBytes) return
+    setIsLoading(true)
+    try {
+      const formData = methods.getValues()
+      const activeFields = fields.filter((field) => autofilledFields.some((af) => af.fieldName === field.name))
+      const filledPdfBytes = await fillPdfFields(pdfBytes, formData, activeFields)
+      const blob = new Blob([filledPdfBytes as any], { type: "application/pdf" })
+      const url = URL.createObjectURL(blob)
+
+      if (openInNewTab) {
+        window.open(url, "_blank")
+      } else {
+        const link = document.createElement("a")
+        link.href = url
+        link.download = fileName.replace(".pdf", "_filled.pdf")
+        document.body.appendChild(link)
+        link.click()
+        document.body.removeChild(link)
+      }
+    } catch (error) {
+      console.error("Error exporting PDF:", error)
+    } finally {
+      setIsLoading(false)
+    }
+  }, [pdfBytes, methods, fileName, fields, autofilledFields])
+
+  const downloadAcroForm = useCallback(async () => {
+    if (!pdfBytes) return
+    setIsLoading(true)
+    try {
+      const acroFormBytes = await generateEmptyAcroForm(pdfBytes, fields)
+      const blob = new Blob([acroFormBytes as any], { type: "application/pdf" })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = url
+      link.download = fileName.replace(".pdf", "_editable_form.pdf")
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+    } catch (error) {
+      console.error("Error creating AcroForm:", error)
+    } finally {
+      setIsLoading(false)
+    }
+  }, [pdfBytes, fields, fileName])
+
   return (
-    <div className="flex flex-1 flex-col overflow-hidden relative">
-      {/* Toolbar */}
-      <div className="flex h-12 shrink-0 items-center overflow-x-auto border-b border-border bg-background px-2">
-        {/* Print Dropdown */}
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              disabled={!hasPdf}
-              className="flex h-8 items-center gap-1 rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
-            >
-              <Printer className="h-4 w-4" />
-              <ChevronDown className="h-3 w-3" />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start">
-            <DropdownMenuItem>Download AcroForm</DropdownMenuItem>
-            <DropdownMenuItem>Download PDF</DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-
-        {/* Refresh / Reset Button */}
-        <button
-          onClick={handleReset}
-          disabled={!hasPdf}
-          title="Reset Viewer"
-          className="ml-1 flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          <RefreshCw className="h-4 w-4" />
-        </button>
-
-        {/* Separators and PDF tools only show if PDF is loaded */}
-        {hasPdf && (
-          <>
-            <div className="mx-2 h-5 w-px bg-border" />
-
-            {/* Interaction Modes */}
-            <button className="flex h-8 w-8 items-center justify-center rounded p-2 text-foreground hover:bg-muted">
-              <MousePointer2 className="h-4 w-4" />
-            </button>
-            <button className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground">
-              <Hand className="h-4 w-4" />
-            </button>
-
-            {/* Wand with dropdown */}
-            <Popover open={isWandActive} onOpenChange={setIsWandActive}>
-              <PopoverTrigger asChild>
+    <FormProvider {...methods}>
+      <div className="flex flex-1 overflow-hidden relative">
+        <div className="flex flex-1 flex-col overflow-hidden relative border-r border-border">
+          {/* Toolbar */}
+          <div className="flex h-12 shrink-0 items-center overflow-x-auto border-b border-border bg-background px-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
                 <button
-                  onClick={() => setIsWandActive(!isWandActive)}
-                  className={`flex h-8 w-8 items-center justify-center rounded p-2 transition-colors ${isWandActive
-                    ? "bg-primary/10 text-primary"
-                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
-                    }`}
+                  disabled={!hasPdf}
+                  className="flex h-8 items-center gap-1 rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
                 >
-                  <Wand className="h-4 w-4" />
+                  <Printer className="h-4 w-4" />
+                  <ChevronDown className="h-3 w-3" />
                 </button>
-              </PopoverTrigger>
-              <PopoverContent
-                align="center"
-                sideOffset={4}
-                className="w-auto p-1"
-                onInteractOutside={(e) => e.preventDefault()}
-                onEscapeKeyDown={(e) => e.preventDefault()}
-              >
-                <div className="flex items-center gap-1">
-                  <Popover>
-                    <PopoverTrigger asChild>
-                      <button className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground">
-                        <LocateFixed className="h-4 w-4" />
-                      </button>
-                    </PopoverTrigger>
-                    <PopoverContent align="center" sideOffset={4} className="w-48 p-2 mt-1"></PopoverContent>
-                  </Popover>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem onClick={downloadAcroForm}>
+                  <FileTypes type="xfa" />
+                  Download AcroForm</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => exportPdf(false)}>
+                  <FileTypes type="pdf" />
+                  Download PDF</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
 
-                  <Popover>
-                    <PopoverTrigger asChild>
-                      <button className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground">
-                        <Mic className="h-4 w-4" />
-                      </button>
-                    </PopoverTrigger>
-                    <PopoverContent align="center" sideOffset={4} className="w-48 p-2 mt-1"></PopoverContent>
-                  </Popover>
+            <button
+              onClick={handleReset}
+              disabled={!hasPdf}
+              title="Reset Viewer"
+              className="ml-1 flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <RefreshCw className="h-4 w-4" />
+            </button>
+
+            {hasPdf && (
+              <>
+                <div className="mx-2 h-5 w-px bg-border" />
+                <button className="flex h-8 w-8 items-center justify-center rounded p-2 text-foreground hover:bg-muted">
+                  <MousePointer2 className="h-4 w-4" />
+                </button>
+                <button className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground">
+                  <Hand className="h-4 w-4" />
+                </button>
+
+                <Popover open={isWandActive} onOpenChange={handleWandToggle}>
+                  <PopoverTrigger asChild>
+                    <button
+                      className={`flex h-8 w-8 items-center justify-center rounded p-2 transition-colors ${isWandActive
+                        ? "bg-blue-50 text-blue-500"
+                        : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                        }`}
+                    >
+                      <Wand className="h-4 w-4" />
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent
+                    align="center"
+                    sideOffset={4}
+                    className="w-auto p-1"
+                    onInteractOutside={(e) => e.preventDefault()}
+                    onEscapeKeyDown={(e) => e.preventDefault()}
+                  >
+                    <div className="flex items-center gap-1">
+                      <Popover open={isDetectionPopoverOpen} onOpenChange={setIsDetectionPopoverOpen}>
+                        <PopoverTrigger asChild>
+                          <button
+                            onClick={(e) => {
+                              if (detectionMode) {
+                                e.preventDefault();
+                                setDetectionMode(null);
+                              } else {
+                                setDetectionMode("auto");
+                              }
+                            }}
+                            onMouseEnter={() => {
+                              if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+                              setIsDetectionPopoverOpen(true);
+                            }}
+                            onMouseLeave={() => {
+                              hoverTimeoutRef.current = setTimeout(() => setIsDetectionPopoverOpen(false), 150);
+                            }}
+                            className={`flex h-8 w-8 items-center justify-center rounded hover:bg-muted ${detectionMode ? "bg-blue-50 text-blue-500" : "text-muted-foreground hover:text-foreground"}`}>
+                            <LocateFixed className="h-4 w-4" />
+                          </button>
+                        </PopoverTrigger>
+                        <PopoverContent
+                          align="center"
+                          sideOffset={4}
+                          className="w-48 p-2 mt-1 z-[60]"
+                          onMouseEnter={() => {
+                            if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
+                            setIsDetectionPopoverOpen(true);
+                          }}
+                          onMouseLeave={() => {
+                            hoverTimeoutRef.current = setTimeout(() => setIsDetectionPopoverOpen(false), 150);
+                          }}
+                        >
+                          <div className="flex flex-col gap-1">
+                            {MODES.map((m) => (
+                              <button
+                                key={m.id}
+                                className={`flex items-center gap-2 w-full px-2 py-1.5 text-sm rounded-sm hover:bg-muted transition-colors ${detectionMode === m.id ? "bg-accent/50" : ""}`}
+                                onClick={() => setDetectionMode(detectionMode === m.id ? null : m.id)}
+                              >
+                                <m.icon className="h-4 w-4" />
+                                <span>{m.label}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </PopoverContent>
+                      </Popover>
+
+                      <AudioRecorder onTranscript={(text) => console.log(text)} />
+                    </div>
+                  </PopoverContent>
+                </Popover>
+
+                <div className="mx-2 h-5 w-px bg-border" />
+                <div className="flex items-center">
+                  <button
+                    onClick={() => onPageChange(Math.max(1, currentPage - 1))}
+                    disabled={currentPage === 1}
+                    className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </button>
+                  <div className="flex items-center gap-1 px-1 text-sm">
+                    <input
+                      type="text"
+                      value={currentPage}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value)
+                        if (!isNaN(val) && val >= 1 && val <= totalPages) {
+                          onPageChange(val)
+                        }
+                      }}
+                      className="w-6 rounded border border-border bg-background px-1 py-0.5 text-center text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                    <span className="text-muted-foreground">/</span>
+                    <span className="text-muted-foreground">{totalPages}</span>
+                  </div>
+                  <button
+                    onClick={() => onPageChange(Math.min(totalPages, currentPage + 1))}
+                    disabled={currentPage === totalPages}
+                    className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </button>
                 </div>
-              </PopoverContent>
-            </Popover>
 
-            <div className="mx-2 h-5 w-px bg-border" />
+                <div className="mx-2 h-5 w-px bg-border" />
+                <div className="flex items-center">
+                  <button
+                    onClick={() => onZoomChange(Math.max(25, zoom - 25))}
+                    className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <Minus className="h-4 w-4" />
+                  </button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button className="flex h-8 items-center gap-1 rounded px-2 text-sm text-foreground hover:bg-muted">
+                        {zoom}%
+                        <ChevronDown className="h-3 w-3 text-muted-foreground" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="center">
+                      <DropdownMenuItem onClick={() => onZoomChange(50)}>50%</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => onZoomChange(75)}>75%</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => onZoomChange(100)}>100%</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => onZoomChange(125)}>125%</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => onZoomChange(150)}>150%</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => onZoomChange(200)}>200%</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <button
+                    onClick={() => onZoomChange(Math.min(200, zoom + 25))}
+                    className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <Plus className="h-4 w-4" />
+                  </button>
+                </div>
+              </>
+            )}
 
-            {/* Pagination */}
-            <div className="flex items-center">
-              <button
-                onClick={() => onPageChange(Math.max(1, currentPage - 1))}
-                disabled={currentPage === 1}
-                className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
-              >
-                <ChevronLeft className="h-4 w-4" />
-              </button>
-              <div className="flex items-center gap-1 px-1 text-sm">
+            <div className="flex-1" />
+
+            {hasPdf && (
+              <div className="relative flex items-center">
+                <Search className="absolute left-2.5 h-3.5 w-3.5 text-zinc-400" />
                 <input
                   type="text"
-                  value={currentPage}
-                  onChange={(e) => {
-                    const val = parseInt(e.target.value)
-                    if (!isNaN(val) && val >= 1 && val <= totalPages) {
-                      onPageChange(val)
-                    }
-                  }}
-                  className="w-6 rounded border border-border bg-background px-1 py-0.5 text-center text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                  value={searchQuery}
+                  onChange={(e) => onSearchChange(e.target.value)}
+                  placeholder="Search document..."
+                  className="h-7 w-44 rounded-full bg-zinc-100 pl-8 pr-3 text-xs text-zinc-700 placeholder:text-zinc-400 focus:outline-none focus:ring-1 focus:ring-zinc-300"
                 />
-                <span className="text-muted-foreground">/</span>
-                <span className="text-muted-foreground">{totalPages}</span>
               </div>
+            )}
+
+            {!isAssistantOpen && (
               <button
-                onClick={() => onPageChange(Math.min(totalPages, currentPage + 1))}
-                disabled={currentPage === totalPages}
-                className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
+                onClick={onToggleAssistant}
+                className="ml-2 flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
               >
-                <ChevronRight className="h-4 w-4" />
+                <MessageSquare className="h-4 w-4" />
               </button>
-            </div>
-
-            <div className="mx-2 h-5 w-px bg-border" />
-
-            {/* Zoom Controls */}
-            <div className="flex items-center">
-              <button
-                onClick={() => onZoomChange(Math.max(25, zoom - 25))}
-                className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                <Minus className="h-4 w-4" />
-              </button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <button className="flex h-8 items-center gap-1 rounded px-2 text-sm text-foreground hover:bg-muted">
-                    {zoom}%
-                    <ChevronDown className="h-3 w-3 text-muted-foreground" />
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="center">
-                  <DropdownMenuItem onClick={() => onZoomChange(50)}>50%</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onZoomChange(75)}>75%</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onZoomChange(100)}>100%</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onZoomChange(125)}>125%</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onZoomChange(150)}>150%</DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onZoomChange(200)}>200%</DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-              <button
-                onClick={() => onZoomChange(Math.min(200, zoom + 25))}
-                className="flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                <Plus className="h-4 w-4" />
-              </button>
-            </div>
-          </>
-        )}
-
-        <div className="flex-1" />
-
-        {/* Search */}
-        {hasPdf && (
-          <div className="relative flex items-center">
-            <Search className="absolute left-2.5 h-3.5 w-3.5 text-zinc-400" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => onSearchChange(e.target.value)}
-              placeholder="Search document..."
-              className="h-7 w-44 rounded-full bg-zinc-100 pl-8 pr-3 text-xs text-zinc-700 placeholder:text-zinc-400 focus:outline-none focus:ring-1 focus:ring-zinc-300"
-            />
+            )}
           </div>
-        )}
 
-        {/* Assistant Toggle */}
-        {!isAssistantOpen && (
-          <button
-            onClick={onToggleAssistant}
-            className="ml-2 flex h-8 w-8 items-center justify-center rounded p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <MessageSquare className="h-4 w-4" />
-          </button>
-        )}
-      </div>
+          <div className={`relative flex-1 overflow-auto ${hasPdf ? "bg-zinc-200" : "bg-white"}`}>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf"
+              onChange={handleFileInputChange}
+              className="hidden"
+            />
 
-      {/* Document Area */}
-      <div className="relative flex-1 overflow-auto bg-white md:bg-zinc-50">
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="application/pdf"
-          onChange={handleFileInputChange}
-          className="hidden"
-        />
-
-        {!hasPdf ? (
-          <div className={`flex h-full w-full items-center justify-center transition-all ${isGlobalDragging ? "p-8" : "p-4"}`}>
-            {/* Custom Upload UI */}
-            <div className={`flex flex-col w-full transition-all ${isGlobalDragging ? "h-full" : "max-w-3xl"}`}>
-              {!isGlobalDragging && (
-                <h1 className="text-xl font-semibold text-slate-800 mb-6">Upload File</h1>
-              )}
-
-              <div className={`grid transition-all ${isGlobalDragging ? "grid-cols-1 h-full" : "grid-cols-1 md:grid-cols-2 gap-8 md:gap-12"}`}>
-                {/* File Uploader via Local Native Drag/Drop */}
-                <div className={`flex flex-col transition-all ${isGlobalDragging ? "h-full" : ""}`}>
+            {!hasPdf ? (
+              <div className={`flex h-full w-full items-center justify-center transition-all ${isGlobalDragging ? "p-8" : "p-4"}`}>
+                <div className={`flex flex-col w-full transition-all ${isGlobalDragging ? "h-full" : "max-w-3xl"}`}>
                   {!isGlobalDragging && (
-                    <h2 className="text-sm font-semibold text-slate-700 mb-3">File Uploader</h2>
+                    <h1 className="text-xl font-semibold text-slate-800 mb-6">Upload File</h1>
                   )}
-                  <div
-                    onClick={handleClick}
-                    onDragEnter={() => setIsLocalDragging(true)}
-                    onDragLeave={() => setIsLocalDragging(false)}
-                    className={`relative flex flex-col items-center justify-center border-dashed rounded-xl cursor-pointer transition-all duration-300 ${isLocalDragging || isGlobalDragging
-                      ? "border-blue-500 bg-blue-50/80 shadow-inner"
-                      : "border-slate-300 bg-slate-50 hover:border-slate-400"
-                      } ${isGlobalDragging
-                        ? "h-full border-4 rounded-[3rem] bg-blue-50/95"
-                        : "h-64 border-2"
-                      }`}
-                  >
-                    <div className="text-center flex flex-col items-center">
-                      {isGlobalDragging ? (
-                        <>
-                          <div className="relative h-10 w-10 animate-bounce text-blue-600">
-                            <FileText className="h-10 w-10 absolute top-0 left-[-20px] z-10 rotate-[-8deg]" fill='#FFF' />
-                            <FileSpreadsheet className="h-10 w-10 absolute top-[-12px] left-1/2 transform -translate-x-1/2 z-0" fill='#FFF' />
-                            <FileType className="h-10 w-10 absolute top-[2px] right-[-20px] z-10 rotate-[8deg]" fill='#FFF' />
-                          </div>
-                          <h2 className="text-2xl font-bold text-blue-600">Drop Files here / Upload files</h2>
-                          <p className="mt-4 text-lg text-blue-500/70">Release to upload your PDF instantly</p>
-                        </>
-                      ) : (
-                        <>
-                          <p className="text-slate-800 font-medium mb-2">Drop files here</p>
-                          <p className="text-slate-400 text-sm mb-4">Or</p>
-                          <button className="px-6 py-2 rounded-full border border-blue-400 text-blue-500 font-medium hover:bg-blue-50 transition-colors">
-                            Upload file
-                          </button>
-                        </>
+
+                  <div className={`grid transition-all ${isGlobalDragging ? "grid-cols-1 h-full" : "grid-cols-1 md:grid-cols-2 gap-8 md:gap-12"}`}>
+                    <div className={`flex flex-col transition-all ${isGlobalDragging ? "h-full" : ""}`}>
+                      {!isGlobalDragging && (
+                        <h2 className="text-sm font-semibold text-slate-700 mb-3">File Uploader</h2>
                       )}
+                      <div
+                        onClick={handleClick}
+                        onDragEnter={() => setIsLocalDragging(true)}
+                        onDragLeave={() => setIsLocalDragging(false)}
+                        className={`relative flex flex-col items-center justify-center border-dashed rounded-xl cursor-pointer transition-all duration-300 ${isLocalDragging || isGlobalDragging
+                          ? "border-blue-500 bg-blue-50/80 shadow-inner"
+                          : "border-slate-300 bg-slate-50 hover:border-slate-400"
+                          } ${isGlobalDragging
+                            ? "h-full border-4 rounded-[3rem] bg-blue-50/95"
+                            : "h-64 border-2"
+                          }`}
+                      >
+                        <div className="text-center flex flex-col items-center">
+                          {isGlobalDragging ? (
+                            <>
+                              <div className="relative h-10 w-10 animate-bounce text-blue-600">
+                                <FileText className="h-10 w-10 absolute top-0 left-[-20px] z-10 rotate-[-8deg]" fill='#FFF' />
+                                <FileSpreadsheet className="h-10 w-10 absolute top-[-12px] left-1/2 transform -translate-x-1/2 z-0" fill='#FFF' />
+                                <FileType className="h-10 w-10 absolute top-[2px] right-[-20px] z-10 rotate-[8deg]" fill='#FFF' />
+                              </div>
+                              <h2 className="text-2xl font-bold text-blue-600">Drop Files here / Upload files</h2>
+                              <p className="mt-4 text-lg text-blue-500/70">Release to upload your PDF instantly</p>
+                            </>
+                          ) : (
+                            <>
+                              <p className="text-slate-800 font-medium mb-2">Drop files here</p>
+                              <p className="text-slate-400 text-sm mb-4">Or</p>
+                              <button className="px-6 py-2 rounded-full border border-blue-400 text-blue-500 font-medium hover:bg-blue-50 transition-colors">
+                                Upload file
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
                     </div>
+
+                    {!isGlobalDragging && (
+                      <div className="flex flex-col">
+                        <h2 className="text-sm font-semibold text-slate-700 mb-3">Import files from:</h2>
+                        <div className="grid grid-cols-2 gap-4 h-64">
+                          <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
+                            <svg viewBox="0 0 24 24" width="35" height="35">
+                              <path d={siGoogledrive.path} fill={`#${siGoogledrive.hex}`} />
+                            </svg>
+                            <span className="text-sm font-medium text-slate-700">Google Drive</span>
+                          </button>
+                          <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
+                            <svg viewBox="0 0 24 24" width="35" height="35">
+                              <path d={siDropbox.path} fill={`#${siDropbox.hex}`} />
+                            </svg>
+                            <span className="text-sm font-medium text-slate-700">Dropbox</span>
+                          </button>
+                          <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
+                            <svg viewBox="0 0 24 24" width="35" height="35">
+                              <path d={siIcloud.path} fill={`#${siIcloud.hex}`} />
+                            </svg>
+                            <span className="text-sm font-medium text-slate-700">One Drive</span>
+                          </button>
+                          <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
+                            <svg viewBox="0 0 24 24" width="35" height="35">
+                              <path d={siBox.path} fill={`#${siBox.hex}`} />
+                            </svg>
+                            <span className="text-sm font-medium text-slate-700">Box</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
-
-                {/* Cloud Providers calling Native Dashboard popup */}
-                {!isGlobalDragging && (
-                  <div className="flex flex-col">
-                    <h2 className="text-sm font-semibold text-slate-700 mb-3">Import files from:</h2>
-                    <div className="grid grid-cols-2 gap-4 h-64">
-                      <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
-                        <svg viewBox="0 0 24 24" width="35" height="35">
-                          <path d={siGoogledrive.path} fill={`#${siGoogledrive.hex}`} />
-                        </svg>
-                        <span className="text-sm font-medium text-slate-700">Google Drive</span>
-                      </button>
-
-                      <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
-                        <svg viewBox="0 0 24 24" width="35" height="35">
-                          <path d={siDropbox.path} fill={`#${siDropbox.hex}`} />
-                        </svg>
-                        <span className="text-sm font-medium text-slate-700">Dropbox</span>
-                      </button>
-
-                      <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
-                        <svg viewBox="0 0 24 24" width="35" height="35">
-                          <path d={siIcloud.path} fill={`#${siIcloud.hex}`} />
-                        </svg>
-                        <span className="text-sm font-medium text-slate-700">One Drive</span>
-                      </button>
-
-                      <button onClick={openDashboard} className="flex flex-col items-center justify-center p-4 gap-2 border border-slate-200 rounded-xl hover:shadow-md transition-shadow bg-white">
-                        <svg viewBox="0 0 24 24" width="35" height="35">
-                          <path d={siBox.path} fill={`#${siBox.hex}`} />
-                        </svg>
-                        <span className="text-sm font-medium text-slate-700">Box</span>
-                      </button>
-                    </div>
-                  </div>
+              </div>
+            ) : (
+              <div className="flex min-h-full w-full justify-center py-8">
+                {pdfUrl && (
+                  <PdfViewer
+                    url={pdfUrl}
+                    fields={fields}
+                    autofilledFields={autofilledFields}
+                    searchQuery={searchQuery}
+                    pageNumber={currentPage}
+                    scale={zoom / 100}
+                    detectionMode={detectionMode}
+                    onCancelDetectionMode={() => setDetectionMode(null)}
+                    onTotalPagesChange={onTotalPagesChange}
+                    onFieldChange={handleFieldChange}
+                    onAcceptField={handleAcceptField}
+                    onAcceptAll={handleAcceptAll}
+                    onDeleteField={handleDeleteField}
+                    onBatchFieldChange={handleBatchFieldChange}
+                    onFieldEdit={handleFieldEdit}
+                    onDetectField={handlePointDetection}
+                    onRelocateField={handleFieldRelocate}
+                    onResizeField={handleFieldResize}
+                    focusedFieldName={focusedFieldName}
+                    onFocusedFieldChange={onFocusedFieldChange}
+                  />
                 )}
               </div>
-            </div>
+            )}
           </div>
-        ) : (
-          <div className="flex min-h-full w-full justify-center px-12 py-8 bg-zinc-200">
-            <Document
-              file={pdfUrl}
-              onLoadSuccess={onDocumentLoadSuccess}
-              loading={
-                <div className="flex h-96 w-full items-center justify-center">
-                  <div className="text-muted-foreground animate-pulse">Loading PDF...</div>
-                </div>
-              }
-            >
-              <Page
-                pageNumber={currentPage}
-                scale={zoom / 100}
-                className="shadow-xl"
-                renderTextLayer={true}
-                renderAnnotationLayer={true}
-              />
-            </Document>
-          </div>
-        )}
+        </div>
       </div>
-    </div>
+    </FormProvider>
   )
 }

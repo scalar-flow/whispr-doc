@@ -6,6 +6,7 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  serverExternalPackages: ["pdfexcavator", "pdfjs-dist"],
 }
 
 export default nextConfig
